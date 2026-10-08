@@ -1,0 +1,7 @@
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14
+scipy>=1.10
+matplotlib>=3.7
+av>=12
+huggingface_hub>=0.20
