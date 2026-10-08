@@ -9,30 +9,42 @@ perimeter toward the center; ring k>0 is an annulus whose bars hang from its
 outer perimeter inward. Every ring is split into even thirds: state (blue),
 task (green), environment (red). Outer rings are darker.
 
+DIRECTION: each ring expresses how well it is reflected in the NEXT OUTER
+ring (ring k is scored against ring k+1). The outermost ring has nothing
+outside it, so it is drawn full. The innermost ring additionally shows
+success rates as grey bars BEHIND its translucent proximity bars.
+
 POINTS, per ring and category
   state        every frame's observation.state, z-scored with the INNERMOST
                ring's mean/std (one global scale). Joints matched by name.
   task         one point per episode: its task string.
   environment  video frames as tiny RGB thumbnails (default 16x12), z-scored
                per image and channel (--env-raw to skip). Each ring is decoded
-               densely (up to --ref-points frames) to serve as a reference;
+               densely (up to --ref-points frames) to serve as a reference
+               for the ring inside it;
                slices are scored on an even subset (--max-points).
 
-SCORE of a point p in ring k against ring k-1 (the next inner ring)
-  d = distance to p's nearest neighbour among ALL ring k-1 reference points
+SCORE of a point p in ring k against ring k+1 (the next outer ring)
+  d = distance to p's nearest neighbour among ALL ring k+1 reference points
       (environment: same camera key when available).
   sigma = innermost ring's grain: median distance from a point to the nearest
       point from a DIFFERENT episode, times --sigma-scale.
   --score coverage (default): 1 if d <= tau*sigma else 0   (--tau, default 1)
   --score kernel:             K(d/sigma), gauss or cauchy  (--kernel)
-  task: d = normalised word-level edit distance to the closest ring k-1 task;
+  task: d = normalised word-level edit distance to the closest ring k+1 task;
       coverage: 1 if d <= --task-tau (default 0 = exact match), kernel: 1-d.
-  Ring 0: 1 if the dataset has no "success" column (placeholder), else the
-      episode's success.
+  Outermost ring: 1 everywhere (no reference outside it).
+
+SUCCESS (innermost ring only)
+  Per-episode success from a data or episode column whose name contains
+  "success", or from --success-file (CSV with columns episode_index,success;
+  values 0/1 or rates; overrides any column). Drawn as grey bars behind the
+  proximity bars, which are translucent (--alpha). No success data -> no
+  grey layer.
 
 SLICES
   --unit episode (default): one slice per episode; value = mean score of that
-      episode's points ("how much of this episode the inner ring covers").
+      episode's points ("how much of this episode the outer ring covers").
   --unit cell: up to --n slices from farthest-point sampling; each owns the
       points nearest to it; value = mean score over the cell.
   --width mass (default): slice angle proportional to frames represented.
@@ -42,7 +54,7 @@ SLICES
   --sort natural: episode order (episode unit) or principal-axis order (cell).
 
 The report (--report) lists every slice plus covered_fraction per category:
-sum(value * frames) / sum(frames).
+sum(value * frames) / sum(frames), plus success_rate for the innermost ring.
 """
 import argparse
 import json
@@ -91,6 +103,13 @@ def resolve(src, cache_dir, want_video):
     local = snapshot_download(repo_id=src, repo_type="dataset", cache_dir=cache_dir,
                               allow_patterns=patterns)
     return Path(local), src
+
+
+def load_success_file(path):
+    t = pd.read_csv(path)
+    if not {"episode_index", "success"} <= set(t.columns):
+        sys.exit(f"{path}: needs columns episode_index,success")
+    return t.groupby("episode_index")["success"].mean().astype(float)
 
 
 def load(src, cache_dir, want_video=True):
@@ -326,25 +345,26 @@ def kernel(z, kind):
     return np.exp(-0.5 * z ** 2) if kind == "gauss" else 1.0 / (1.0 + z ** 2)
 
 
-def score_points(cat, cd, inner, sigma, a):
+def score_points(cat, cd, outer, sigma, a):
+    """Score ring k's points against ring k+1's reference points."""
     if cat == "task":
-        uniq = sorted(set(inner.ref.X))
+        uniq = sorted(set(outer.ref.X))
         cache = {t: min(word_edit(t, u) for u in uniq) for t in set(cd.ev.X)}
         d = np.array([cache[t] for t in cd.ev.X])
         return (d <= a.task_tau).astype(float) if a.score == "coverage" else 1 - d
-    d = nn_dist(cd.ev, inner.ref, by_group=(cat == "environment"))
+    d = nn_dist(cd.ev, outer.ref, by_group=(cat == "environment"))
     z = d / sigma
     return (z <= a.tau).astype(float) if a.score == "coverage" else kernel(z, a.kernel)
 
 
-def method_text(cat, k, a, sigma, has_success):
-    if k == 0:
-        return "episode success" if has_success else "PLACEHOLDER: no success field; value = 1"
+def method_text(cat, outermost, a, sigma):
+    if outermost:
+        return "outermost ring: no outer reference; drawn full (value 1)"
     if cat == "task":
-        return (f"coverage: word-edit distance to ring k-1 tasks <= {a.task_tau}" if a.score == "coverage"
-                else "1 - min normalised word-edit distance to ring k-1 tasks")
+        return (f"coverage: word-edit distance to ring k+1 tasks <= {a.task_tau}" if a.score == "coverage"
+                else "1 - min normalised word-edit distance to ring k+1 tasks")
     if a.score == "coverage":
-        return f"coverage: d_nn to ring k-1 <= {a.tau} * sigma (sigma={sigma:.4g})"
+        return f"coverage: d_nn to ring k+1 <= {a.tau} * sigma (sigma={sigma:.4g})"
     return f"kernel {a.kernel}: K(d_nn / sigma), sigma={sigma:.4g}"
 
 
@@ -360,7 +380,7 @@ def farthest_points(D_from, n_pts, n, start):
     return chosen
 
 
-def slices_by_episode(cat, ds, ev, scores):
+def slices_by_episode(cat, ds, ev, scores, success=None):
     out, missing = [], 0
     for e in ds.ep_len.index:
         m = ev.episode == e
@@ -368,13 +388,15 @@ def slices_by_episode(cat, ds, ev, scores):
             v = float(np.average(scores[m], weights=ev.weight[m]))
         else:
             v, missing = 0.0, missing + 1
-        out.append({"label": f"ep {int(e)}", "value": v, "mass": float(ds.ep_len.loc[e]), "order": int(e)})
+        sv = None if success is None else float(np.nan_to_num(success.get(e, np.nan)))
+        out.append({"label": f"ep {int(e)}", "value": v, "success": sv,
+                    "mass": float(ds.ep_len.loc[e]), "order": int(e)})
     if missing:
         issue(f"{ds.name} {cat}: {missing} episodes had no sampled points (value 0); raise --max-points")
     return out
 
 
-def slices_by_cell(cat, ev, scores, n):
+def slices_by_cell(cat, ev, scores, n, success=None):
     if cat == "task":
         uniq = sorted(set(ev.X))
         D = np.array([[word_edit(x, y) for y in uniq] for x in uniq])
@@ -394,25 +416,30 @@ def slices_by_cell(cat, ev, scores, n):
         pc1 = np.linalg.svd(Xc[even_idx(len(X), 5000)], full_matrices=False)[2][0]
         order = sorted(S, key=lambda i: (ev.group[i], float(Xc[i] @ pc1)))
         labels = {s: (f"{ev.group[s] or 'cell'} #{i}", i) for i, s in enumerate(order)}
+    ps = None if success is None else \
+        np.array([np.nan_to_num(success.get(e, np.nan)) for e in ev.episode])
     out = []
     for key, (lab, o) in labels.items():
         m = cell == key
         out.append({"label": lab, "value": float(np.average(scores[m], weights=ev.weight[m])),
+                    "success": None if ps is None else float(np.average(ps[m], weights=ev.weight[m])),
                     "mass": float(ev.weight[m].sum()), "order": o})
     return out
 
 
 # ----------------------------------------------------------------- render
-def render(rings, path, title, width_mode):
+def render(rings, path, title, width_mode, alpha):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle, Wedge
+    from matplotlib.patches import Circle, Patch, Wedge
 
     L = len(rings)
     R0, T = 0.5, 0.45
-    fig, ax = plt.subplots(figsize=(8, 8.6))
+    SUCCESS_RGB = (0.45, 0.45, 0.45)
+    fig, ax = plt.subplots(figsize=(8, 8.8))
     third = 120.0
+    any_success = False
     for k, ring in enumerate(rings):
         dark = 1 - 0.5 * k / max(1, L - 1)
         r_out = R0 + k * T
@@ -428,12 +455,24 @@ def render(rings, path, title, width_mode):
             sl = entry["slices"]
             mass = np.array([s["mass"] for s in sl]) if width_mode == "mass" else np.ones(len(sl))
             spans = third * mass / mass.sum()
+            layered = any(s.get("success") is not None for s in sl)
+            any_success |= layered
             s0 = a0
             for s, span in zip(sl, spans):
+                t1, t2 = 90 - s0 - span, 90 - s0
+                if layered:  # success behind, drawn opaque
+                    sd = depth_max * min(max(s["success"] or 0.0, 0.0), 1.0)
+                    if sd > 0:
+                        ax.add_patch(Wedge((0, 0), r_out, t1, t2, width=sd,
+                                           fc=SUCCESS_RGB, ec=SUCCESS_RGB, lw=0.2))
                 depth = depth_max * min(max(s["value"], 0.0), 1.0)
                 if depth > 0:
-                    ax.add_patch(Wedge((0, 0), r_out, 90 - s0 - span, 90 - s0, width=depth,
-                                       fc=col, ec=col, lw=0.2))
+                    if layered:  # proximity in front, translucent
+                        ax.add_patch(Wedge((0, 0), r_out, t1, t2, width=depth,
+                                           fc=col, ec="none", lw=0, alpha=alpha))
+                    else:
+                        ax.add_patch(Wedge((0, 0), r_out, t1, t2, width=depth,
+                                           fc=col, ec=col, lw=0.2))
                 s0 += span
         ax.add_patch(Circle((0, 0), r_out, fill=False, ec="0.55", lw=0.8))
     rmax = R0 + (L - 1) * T
@@ -446,13 +485,28 @@ def render(rings, path, title, width_mode):
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")
     ax.axis("off")
-    legend = "\n".join(
-        f"ring {k} ({'innermost' if k == 0 else 'vs ring ' + str(k - 1)}): {r['name']}  covered "
-        + "  ".join(f"{c[0]}={r['categories'][c]['covered_fraction']:.2f}" if r["categories"].get(c)
-                    else f"{c[0]}=--" for c in CATS)
-        for k, r in enumerate(rings))
+    if any_success:
+        ax.legend(handles=[Patch(fc=SUCCESS_RGB, label="success rate (innermost, behind)"),
+                           Patch(fc="0.5", alpha=alpha, label="proximity to next outer ring")],
+                  loc="upper right", fontsize=8, frameon=False)
+
+    lines = []
+    for k, r in enumerate(rings):
+        if k == L - 1 and L > 1:
+            lines.append(f"ring {k} (outermost, reference): {r['name']}")
+            continue
+        vs = f"vs ring {k + 1}" if k < L - 1 else "single ring"
+        cov = "  ".join(f"{c[0]}={r['categories'][c]['covered_fraction']:.2f}"
+                        if r["categories"].get(c) and r["categories"][c]["covered_fraction"] is not None
+                        else f"{c[0]}=--" for c in CATS)
+        line = f"ring {k} ({vs}): {r['name']}  covered {cov}"
+        sr = next((r["categories"][c]["success_rate"] for c in CATS
+                   if r["categories"].get(c, {}).get("success_rate") is not None), None)
+        if sr is not None:
+            line += f"  | success {sr:.2f}"
+        lines.append(line)
     ax.set_title(title, fontsize=11)
-    fig.text(0.02, 0.01, legend, fontsize=8, family="monospace", va="bottom")
+    fig.text(0.02, 0.01, "\n".join(lines), fontsize=8, family="monospace", va="bottom")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -476,6 +530,10 @@ def main(argv=None):
     ap.add_argument("--env-raw", action="store_true", help="don't normalise thumbnails per image")
     ap.add_argument("--env-keyframes", action="store_true", help="decode keyframes only (fast)")
     ap.add_argument("--no-env", action="store_true", help="skip video (and video download)")
+    ap.add_argument("--success-file", default=None,
+                    help="CSV episode_index,success for the innermost dataset")
+    ap.add_argument("--alpha", type=float, default=0.6,
+                    help="opacity of proximity bars drawn over success bars")
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--out", default="rings.png")
     ap.add_argument("--report", default="rings.json")
@@ -483,6 +541,14 @@ def main(argv=None):
     thumb = tuple(int(v) for v in a.thumb.lower().split("x"))
 
     dss = [load(s, a.cache_dir, want_video=not a.no_env) for s in a.datasets]
+    if a.success_file:
+        dss[0].success = load_success_file(a.success_file)
+        hit = dss[0].success.index.isin(dss[0].ep_len.index).sum()
+        if hit < len(dss[0].ep_len):
+            issue(f"--success-file covers {hit} of {len(dss[0].ep_len)} innermost episodes; "
+                  "missing ones count as 0")
+    if dss[0].success is None:
+        issue(f"{dss[0].name}: no success data (column or --success-file); success layer omitted")
 
     names = [flat_names(d.info["features"].get("observation.state", {}).get("names")) for d in dss]
     if all(names):
@@ -519,40 +585,46 @@ def main(argv=None):
     sigmas = {cat: grain(data[0][cat], a.max_points, a.ref_points) * a.sigma_scale
               for cat in ["state", "environment"] if data[0][cat] is not None}
 
+    L = len(dss)
     rings = []
     for k, (ds, dd) in enumerate(zip(dss, data)):
+        outermost = k == L - 1
         ring = {"name": ds.name, "categories": {}}
         for cat in CATS:
             cd = dd[cat]
             if cd is None:
                 continue
-            if k == 0:
-                if ds.success is not None:
-                    scores = np.array([ds.success.get(e, np.nan) for e in cd.ev.episode])
-                    scores = np.nan_to_num(scores, nan=0.0)
-                else:
-                    scores = np.ones(len(cd.ev.episode))
-            elif data[k - 1][cat] is None or (cat != "task" and cat not in sigmas):
-                issue(f"ring {k} {cat}: no inner reference; values set to 0")
+            if outermost:
+                scores = np.ones(len(cd.ev.episode))
+            elif data[k + 1][cat] is None or (cat != "task" and cat not in sigmas):
+                issue(f"ring {k} {cat}: no {cat} reference in ring {k + 1}; values set to 0")
                 scores = np.zeros(len(cd.ev.episode))
             else:
-                scores = score_points(cat, cd, data[k - 1][cat], sigmas.get(cat), a)
+                scores = score_points(cat, cd, data[k + 1][cat], sigmas.get(cat), a)
+            success = ds.success if k == 0 else None
 
-            sl = slices_by_episode(cat, ds, cd.ev, scores) if a.unit == "episode" \
-                else slices_by_cell(cat, cd.ev, scores, a.n)
-            key = (lambda s: (-s["value"], s["order"])) if a.sort == "value" else (lambda s: s["order"])
-            sl = sorted(sl, key=key)
+            sl = slices_by_episode(cat, ds, cd.ev, scores, success) if a.unit == "episode" \
+                else slices_by_cell(cat, cd.ev, scores, a.n, success)
+            if a.sort == "value":
+                sl = sorted(sl, key=lambda s: (-s["value"], -(s["success"] or 0), s["order"]))
+            else:
+                sl = sorted(sl, key=lambda s: s["order"])
             mass = np.array([s["mass"] for s in sl])
             vals = np.array([s["value"] for s in sl])
-            ring["categories"][cat] = {
-                "method": method_text(cat, k, a, sigmas.get(cat), ds.success is not None),
+            entry = {
+                "method": method_text(cat, outermost and L > 1, a, sigmas.get(cat)),
                 "unit": a.unit,
-                "covered_fraction": float((vals * mass).sum() / mass.sum()),
-                "slices": [{kk: s[kk] for kk in ("label", "value", "mass")} for s in sl]}
+                "covered_fraction": None if (outermost and L > 1) else float((vals * mass).sum() / mass.sum()),
+                "slices": [{kk: s[kk] for kk in ("label", "value", "mass")}
+                           | ({"success": s["success"]} if s["success"] is not None else {}) for s in sl]}
+            if success is not None:
+                sv = np.array([s["success"] for s in sl])
+                entry["success_rate"] = float((sv * mass).sum() / mass.sum())
+            ring["categories"][cat] = entry
         rings.append(ring)
 
-    title = "generalization rings (inner -> outer): " + " | ".join(d.name for d in dss)
-    render(rings, a.out, title, a.width)
+    title = "generalization rings (each ring vs the next outer): " + " | ".join(d.name for d in dss)
+    render(rings, a.out, title, a.width, a.alpha)
     settings = {k: v for k, v in vars(a).items() if k not in ("datasets", "out", "report", "cache_dir")}
     Path(a.report).write_text(json.dumps(
         {"settings": settings, "sigmas": sigmas, "rings": rings, "issues": ISSUES}, indent=2))
@@ -562,8 +634,11 @@ def main(argv=None):
         print(f"ring {k}: {r['name']}")
         for cat in CATS:
             e = r["categories"].get(cat)
-            if e:
-                print(f"  {cat:12s} slices={len(e['slices']):4d}  covered={e['covered_fraction']:.3f}")
+            if e and e["covered_fraction"] is None:
+                print(f"  {cat:12s} slices={len(e['slices']):4d}  (outermost reference)")
+            elif e:
+                extra = f"  success={e['success_rate']:.3f}" if "success_rate" in e else ""
+                print(f"  {cat:12s} slices={len(e['slices']):4d}  covered={e['covered_fraction']:.3f}{extra}")
             else:
                 print(f"  {cat:12s} (missing)")
     if ISSUES:
